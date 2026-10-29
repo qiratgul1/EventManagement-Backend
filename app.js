@@ -12,6 +12,8 @@ const cloudinary = require("cloudinary").v2;
 const helmet = require("helmet");
 const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
+const path = require("path");
+const fs = require("fs");
 
 const User = require("./models/User");
 const Expo = require("./models/Expo");
@@ -64,9 +66,30 @@ app.use(["/login", "/register", "/forgot-password", "/reset-password"],
     rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, message: { message: "Too many attempts, please try again later" } }));
 
 
+// ================= LOCAL UPLOADS (fallback when Cloudinary fails) =================
+
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// CORP header lets the frontend (another port) display these images
+app.use("/uploads", express.static(UPLOAD_DIR, {
+    setHeaders: (res) => res.setHeader("Cross-Origin-Resource-Policy", "cross-origin")
+}));
+
+const cloudinaryReady = () =>
+    !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
+
+const saveLocally = (file, req) => {
+    const ext = path.extname(file.originalname || "").toLowerCase().replace(/[^.a-z0-9]/g, "");
+    const name = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, name), file.buffer);
+    return `${req.protocol}://${req.get("host")}/uploads/${name}`;
+};
+
+
 // ================= PORT ===================
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
 
 // ================= MONGODB =================
@@ -1690,19 +1713,36 @@ app.post("/api/upload", verifyToken, (req, res) => {
                 return res.status(400).json({ message: "No file uploaded. Use form field name 'file'" });
             }
 
-            if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-                return res.status(500).json({ message: "Cloudinary is not configured on the server" });
-            }
-
             const folder = ["logos", "documents", "floorplans"].includes(req.query.folder) ? req.query.folder : "general";
 
-            const result = await uploadToCloudinary(req.file.buffer, folder);
+            let url = null;
+            let storage = "cloudinary";
+            let warning;
+
+            // 1) try Cloudinary
+            if (cloudinaryReady()) {
+                try {
+                    const result = await uploadToCloudinary(req.file.buffer, folder);
+                    url = result.secure_url;
+                } catch (cloudError) {
+                    console.log("Cloudinary upload failed:", cloudError.message || cloudError);
+                    warning = `Cloudinary failed (${cloudError.message || "unknown error"}). Saved on the server instead.`;
+                }
+            }
+
+            // 2) fallback: save on this server (always works locally)
+            if (!url) {
+                url = saveLocally(req.file, req);
+                storage = "local";
+                warning = warning || "Cloudinary is not configured. Saved on the server instead.";
+            }
 
             res.status(201).json({
                 message: "File uploaded successfully",
                 name: req.file.originalname,
-                url: result.secure_url,
-                publicId: result.public_id
+                url,
+                storage,
+                warning
             });
 
         } catch (error) {
